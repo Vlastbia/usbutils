@@ -1,11 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0+
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * USB descriptor definitions
  *
  * Copyright (C) 2017-2018 Michael Drake <michael.drake@codethink.co.uk>
  */
-
-#include "config.h"
 
 #include <stdbool.h>
 #include <stdlib.h>
@@ -543,7 +541,7 @@ static const struct desc desc_audio_3_ac_proc_unit_stereo_extender[] = {
 };
 
 /** UAC3: 4.5.2.10.3 Multi Func Proc Unit Descriptor; Algorithms; Table 4-41. */
-static const char *uac3_proc_unit_multi_func_algorithms[] = {
+static const char * const uac3_proc_unit_multi_func_algorithms[] = {
 	[0] = "Algorithm Undefined.",
 	[1] = "Beam Forming.",
 	[2] = "Acoustic Echo Cancellation.",
@@ -966,7 +964,7 @@ static void desc_snowflake_dump_uac1_as_interface_wformattag(
 
 	/* Format codes are 0xTNNN, where T=Type prefix, NNN = format code. */
 
-	if (value <= ((UAC_FORMAT_TYPE_I << 12) +
+	if (value < ((UAC_FORMAT_TYPE_I << 12) +
 	              ARRAY_LEN(audio_data_format_type_i))) {
 		format_string = audio_data_format_type_i[value];
 

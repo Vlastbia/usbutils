@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2010 Nikolai Kondrashov
+
 2014-11-11: 1.4
     * Request report descriptor with size specified in the interface descriptor
       to fix retrieval with some devices (e.g. Waltop Vega Tablet) which
@@ -21,7 +24,7 @@
     * Added interface number limiting option -i, --interface=NUMBER.
     * Added stream interrupt transfer timeout option -t,
       --stream-timeout=NUMBER, which is set to 1 minute by default to
-      allow recovery of accidentially captured terminal input device.
+      allow recovery of accidentally captured terminal input device.
       This timeout is printed on the start of stream dumping.
 
 2010-08-24: 1.1

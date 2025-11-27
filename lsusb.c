@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0+
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * lspci like utility for the USB bus
  *
@@ -6,7 +6,6 @@
  * Copyright (C) 2003-2005 David Brownell
  */
 
-#include "config.h"
 #include <stdint.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -17,16 +16,12 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdbool.h>
-
-#ifdef HAVE_BYTESWAP_H
-#include <byteswap.h>
-#endif
-
 #include <libusb.h>
 #include <unistd.h>
 
 #include "lsusb.h"
 #include "names.h"
+#include "sysfs.h"
 #include "usbmisc.h"
 #include "desc-defs.h"
 #include "desc-dump.h"
@@ -104,7 +99,6 @@
 
 #define VERBLEVEL_DEFAULT 0	/* 0 gives lspci behaviour; 1, lsusb-0.9 */
 
-#define CTRL_RETRIES	 2
 #define CTRL_TIMEOUT	(5*1000)	/* milliseconds */
 
 #define	HUB_STATUS_BYTELEN	3	/* max 3 bytes status = hub + 23 ports */
@@ -116,32 +110,26 @@
 #define WEBUSB_GET_URL		0x02
 #define USB_DT_WEBUSB_URL	0x03
 
+/* New speeds are only in newer versions of libusb */
+#ifndef LIBUSB_SPEED_SUPER_PLUS_X2
+#define LIBUSB_SPEED_SUPER_PLUS_X2	6
+#endif
+
 unsigned int verblevel = VERBLEVEL_DEFAULT;
 static int do_report_desc = 1;
-static const char * const encryption_type[] = {
-	"UNSECURE",
-	"WIRED",
-	"CCM_1",
-	"RSA_1",
-	"RESERVED"
+static const char *const encryption_type[] = {
+	"INSECURE", "WIRED", "CCM_1", "RSA_1", "RESERVED",
 };
 
-static const char * const vconn_power[] = {
-	"1W",
-	"1.5W",
-	"2W",
-	"3W",
-	"4W",
-	"5W",
-	"6W",
-	"reserved"
+static const char *const vconn_power[] = {
+	"1W", "1.5W", "2W", "3W", "4W", "5W", "6W", "reserved",
 };
 
-static const char * const alt_mode_state[] = {
+static const char *const alt_mode_state[] = {
 	"Unspecified Error",
 	"Alternate Mode configuration not attempted",
 	"Alternate Mode configuration attempted but unsuccessful",
-	"Alternate Mode configuration successful"
+	"Alternate Mode configuration successful",
 };
 
 static void dump_interface(libusb_device_handle *dev, const struct libusb_interface *interface);
@@ -150,9 +138,10 @@ static void dump_audiocontrol_interface(libusb_device_handle *dev, const unsigne
 static void dump_audiostreaming_interface(libusb_device_handle *dev, const unsigned char *buf, int protocol);
 static void dump_midistreaming_interface(libusb_device_handle *dev, const unsigned char *buf);
 static void dump_videocontrol_interface(libusb_device_handle *dev, const unsigned char *buf, int protocol);
+static void dump_videocontrol_interrupt_endpoint(const unsigned char *buf);
 static void dump_videostreaming_interface(const unsigned char *buf);
 static void dump_dfu_interface(const unsigned char *buf);
-static char *dump_comm_descriptor(libusb_device_handle *dev, const unsigned char *buf, char *indent);
+static void dump_comm_descriptor(libusb_device_handle *dev, const unsigned char *buf, const char *indent);
 static void dump_hid_device(libusb_device_handle *dev, const struct libusb_interface_descriptor *interface, const unsigned char *buf);
 static void dump_printer_device(libusb_device_handle *dev, const struct libusb_interface_descriptor *interface, const unsigned char *buf);
 static void dump_audiostreaming_endpoint(libusb_device_handle *dev, const unsigned char *buf, int protocol);
@@ -160,7 +149,6 @@ static void dump_midistreaming_endpoint(const unsigned char *buf);
 static void dump_hub(const char *prefix, const unsigned char *p, int tt_type);
 static void dump_ccid_device(const unsigned char *buf);
 static void dump_billboard_device_capability_desc(libusb_device_handle *dev, unsigned char *buf);
-static void dump_billboard_alt_mode_capability_desc(libusb_device_handle *dev, unsigned char *buf);
 
 /* ---------------------------------------------------------------------- */
 
@@ -266,26 +254,55 @@ static void dump_junk(const unsigned char *buf, const char *indent, unsigned int
  */
 
 static void dump_device(
-	libusb_device_handle *dev,
+	libusb_device *dev,
 	struct libusb_device_descriptor *descriptor
 )
 {
 	char vendor[128], product[128];
 	char cls[128], subcls[128], proto[128];
-	char *mfg, *prod, *serial;
+	char mfg[128] = {0}, prod[128] = {0}, serial[128] = {0};
+	char sysfs_name[PATH_MAX];
+	const char *negotiated_speed;
 
-	get_vendor_string(vendor, sizeof(vendor), descriptor->idVendor);
-	get_product_string(product, sizeof(product),
-			descriptor->idVendor, descriptor->idProduct);
+	get_vendor_product_with_fallback(vendor, sizeof(vendor),
+			product, sizeof(product), dev);
 	get_class_string(cls, sizeof(cls), descriptor->bDeviceClass);
 	get_subclass_string(subcls, sizeof(subcls),
 			descriptor->bDeviceClass, descriptor->bDeviceSubClass);
 	get_protocol_string(proto, sizeof(proto), descriptor->bDeviceClass,
 			descriptor->bDeviceSubClass, descriptor->bDeviceProtocol);
 
-	mfg = get_dev_string(dev, descriptor->iManufacturer);
-	prod = get_dev_string(dev, descriptor->iProduct);
-	serial = get_dev_string(dev, descriptor->iSerialNumber);
+	if (get_sysfs_name(sysfs_name, sizeof(sysfs_name), dev) >= 0) {
+		read_sysfs_prop(mfg, sizeof(mfg), sysfs_name, "manufacturer");
+		read_sysfs_prop(prod, sizeof(prod), sysfs_name, "product");
+		read_sysfs_prop(serial, sizeof(serial), sysfs_name, "serial");
+	}
+
+	switch (libusb_get_device_speed(dev)) {
+		case LIBUSB_SPEED_LOW:
+			negotiated_speed = "Low Speed (1Mbps)";
+			break;
+		case LIBUSB_SPEED_FULL:
+			negotiated_speed = "Full Speed (12Mbps)";
+			break;
+		case LIBUSB_SPEED_HIGH:
+			negotiated_speed = "High Speed (480Mbps)";
+			break;
+		case LIBUSB_SPEED_SUPER:
+			negotiated_speed = "SuperSpeed (5Gbps)";
+			break;
+		case LIBUSB_SPEED_SUPER_PLUS:
+			negotiated_speed = "SuperSpeed+ (10Gbps)";
+			break;
+		case LIBUSB_SPEED_SUPER_PLUS_X2:
+			negotiated_speed = "SuperSpeed++ (20Gbps)";
+			break;
+		case LIBUSB_SPEED_UNKNOWN:
+		default:
+			negotiated_speed = "Unknown";
+			break;
+	}
+	printf("Negotiated speed: %s\n", negotiated_speed);
 
 	printf("Device Descriptor:\n"
 	       "  bLength             %5u\n"
@@ -314,10 +331,6 @@ static void dump_device(
 	       descriptor->iProduct, prod,
 	       descriptor->iSerialNumber, serial,
 	       descriptor->bNumConfigurations);
-
-	free(mfg);
-	free(prod);
-	free(serial);
 }
 
 static void dump_wire_adapter(const unsigned char *buf)
@@ -661,7 +674,7 @@ static void dump_interface(libusb_device_handle *dev, const struct libusb_interf
 
 static void dump_pipe_desc(const unsigned char *buf)
 {
-	static const char *pipe_name[] = {
+	static const char * const pipe_name[] = {
 		"Reserved",
 		"Command pipe",
 		"Status pipe",
@@ -747,6 +760,10 @@ static void dump_endpoint(libusb_device_handle *dev, const struct libusb_interfa
 					dump_audiostreaming_endpoint(dev, buf, interface->bInterfaceProtocol);
 				else if (interface->bInterfaceClass == 1 && interface->bInterfaceSubClass == 3)
 					dump_midistreaming_endpoint(buf);
+				else if (interface->bInterfaceClass == 14 &&
+					 interface->bInterfaceSubClass == 1)
+					dump_videocontrol_interrupt_endpoint(
+						buf);
 				break;
 			case USB_DT_CS_INTERFACE:
 				/* MISPLACED DESCRIPTOR ... less indent */
@@ -792,6 +809,10 @@ static void dump_endpoint(libusb_device_handle *dev, const struct libusb_interfa
 						(buf[3] & 0x3))
 					printf("        Mult %20u\n",
 							buf[3] & 0x3);
+				if ((endpoint->bmAttributes & 3) == 1 ||
+				    (endpoint->bmAttributes & 3) == 3)
+					printf("        wBytesPerInterval %7u\n",
+							buf[4] | buf[5] << 8);
 				break;
 			default:
 				/* often a misplaced class descriptor */
@@ -807,10 +828,15 @@ static void dump_endpoint(libusb_device_handle *dev, const struct libusb_interfa
 
 static void dump_unit(unsigned int data, unsigned int len)
 {
-	char *systems[5] = { "None", "SI Linear", "SI Rotation",
-			"English Linear", "English Rotation" };
+	static const char * const systems[5] = {
+		"None",
+		"SI Linear",
+		"SI Rotation",
+		"English Linear",
+		"English Rotation",
+	};
 
-	char *units[5][8] = {
+	static const char * const units[5][8] = {
 		{ "None", "None", "None", "None", "None",
 				"None", "None", "None" },
 		{ "None", "Centimeter", "Gram", "Seconds", "Kelvin",
@@ -1496,7 +1522,7 @@ static void dump_midistreaming_endpoint(const unsigned char *buf)
 	       "          bDescriptorType     %5u\n"
 	       "          bDescriptorSubtype  %5u (%s)\n"
 	       "          bNumEmbMIDIJack     %5u\n",
-	       buf[0], buf[1], buf[2], buf[2] == 1 ? "GENERAL" : "Invalid", buf[3]);
+	       buf[0], buf[1], buf[2], buf[2] == 2 ? "GENERAL" : "Invalid", buf[3]);
 	for (j = 0; j < buf[3]; j++)
 		printf("          baAssocJackID(%2u)   %5u\n", j, buf[4+j]);
 	dump_junk(buf, "          ", 4+buf[3]);
@@ -1508,32 +1534,76 @@ static void dump_midistreaming_endpoint(const unsigned char *buf)
 
 static void dump_videocontrol_interface(libusb_device_handle *dev, const unsigned char *buf, int protocol)
 {
-	static const char * const ctrlnames[] = {
-		"Brightness", "Contrast", "Hue", "Saturation", "Sharpness", "Gamma",
-		"White Balance Temperature", "White Balance Component", "Backlight Compensation",
-		"Gain", "Power Line Frequency", "Hue, Auto", "White Balance Temperature, Auto",
-		"White Balance Component, Auto", "Digital Multiplier", "Digital Multiplier Limit",
-		"Analog Video Standard", "Analog Video Lock Status", "Contrast, Auto"
+	static const char *const ctrlnames[] = {
+		"Brightness",
+		"Contrast",
+		"Hue",
+		"Saturation",
+		"Sharpness",
+		"Gamma",
+		"White Balance Temperature",
+		"White Balance Component",
+		"Backlight Compensation",
+		"Gain",
+		"Power Line Frequency",
+		"Hue, Auto",
+		"White Balance Temperature, Auto",
+		"White Balance Component, Auto",
+		"Digital Multiplier",
+		"Digital Multiplier Limit",
+		"Analog Video Standard",
+		"Analog Video Lock Status",
+		"Contrast, Auto",
 	};
-	static const char * const camctrlnames[] = {
-		"Scanning Mode", "Auto-Exposure Mode", "Auto-Exposure Priority",
-		"Exposure Time (Absolute)", "Exposure Time (Relative)", "Focus (Absolute)",
-		"Focus (Relative)", "Iris (Absolute)", "Iris (Relative)", "Zoom (Absolute)",
-		"Zoom (Relative)", "PanTilt (Absolute)", "PanTilt (Relative)",
-		"Roll (Absolute)", "Roll (Relative)", "Reserved", "Reserved", "Focus, Auto",
-		"Privacy", "Focus, Simple", "Window", "Region of Interest"
+	static const char *const camctrlnames[] = {
+		"Scanning Mode",
+		"Auto-Exposure Mode",
+		"Auto-Exposure Priority",
+		"Exposure Time (Absolute)",
+		"Exposure Time (Relative)",
+		"Focus (Absolute)",
+		"Focus (Relative)",
+		"Iris (Absolute)",
+		"Iris (Relative)",
+		"Zoom (Absolute)",
+		"Zoom (Relative)",
+		"PanTilt (Absolute)",
+		"PanTilt (Relative)",
+		"Roll (Absolute)",
+		"Roll (Relative)",
+		"Reserved",
+		"Reserved",
+		"Focus, Auto",
+		"Privacy",
+		"Focus, Simple",
+		"Window",
+		"Region of Interest",
 	};
-	static const char * const enctrlnames[] = {
-		"Select Layer", "Profile and Toolset", "Video Resolution", "Minimum Frame Interval",
-		"Slice Mode", "Rate Control Mode", "Average Bit Rate", "CPB Size", "Peak Bit Rate",
-		"Quantization Parameter", "Synchronization and Long-Term Reference Frame",
-		"Long-Term Buffer", "Picture Long-Term Reference", "LTR Validation",
-		"Level IDC", "SEI Message", "QP Range", "Priority ID", "Start or Stop Layer/View",
-		"Error Resiliency"
+	static const char *const enctrlnames[] = {
+		"Select Layer",
+		"Profile and Toolset",
+		"Video Resolution",
+		"Minimum Frame Interval",
+		"Slice Mode",
+		"Rate Control Mode",
+		"Average Bit Rate",
+		"CPB Size",
+		"Peak Bit Rate",
+		"Quantization Parameter",
+		"Synchronization and Long-Term Reference Frame",
+		"Long-Term Buffer",
+		"Picture Long-Term Reference",
+		"LTR Validation",
+		"Level IDC",
+		"SEI Message",
+		"QP Range",
+		"Priority ID",
+		"Start or Stop Layer/View",
+		"Error Resiliency",
 	};
-	static const char * const stdnames[] = {
-		"None", "NTSC - 525/60", "PAL - 625/50", "SECAM - 625/50",
-		"NTSC - 625/50", "PAL - 525/60" };
+	static const char *const stdnames[] = {
+		"None", "NTSC - 525/60", "PAL - 625/50", "SECAM - 625/50", "NTSC - 625/50", "PAL - 525/60",
+	};
 	unsigned int i, ctrls, stds, n, p, termt, freq;
 	char *term = NULL, termts[128];
 
@@ -1727,6 +1797,25 @@ static void dump_videocontrol_interface(libusb_device_handle *dev, const unsigne
 	free(term);
 }
 
+static void dump_videocontrol_interrupt_endpoint(const unsigned char *buf)
+{
+	unsigned int wMaxTransferSize;
+
+	if (buf[0] < 5)
+		printf("      Warning: Descriptor too short\n");
+	if (buf[1] != USB_DT_CS_ENDPOINT)
+		printf("      Warning: Invalid descriptor\n");
+	wMaxTransferSize = buf[3] | (buf[4] << 8);
+	printf("        VideoControl Endpoint Descriptor:\n"
+	       "          bLength             %5u\n"
+	       "          bDescriptorType     %5u\n"
+	       "          bDescriptorSubtype  %5u (%s)\n"
+	       "          wMaxTransferSize    %5u\n",
+	       buf[0], buf[1], buf[2], buf[2] == 3 ? "EP_INTERRUPT" : "Invalid",
+	       wMaxTransferSize);
+	dump_junk(buf, "          ", 5);
+}
+
 static void dump_videostreaming_interface(const unsigned char *buf)
 {
 	static const char * const colorPrims[] = { "Unspecified", "BT.709,sRGB",
@@ -1756,15 +1845,16 @@ static void dump_videostreaming_interface(const unsigned char *buf)
 			printf("      Warning: Descriptor too short\n");
 		printf("        bNumFormats                     %5u\n"
 		       "        wTotalLength                   0x%04x\n"
-		       "        bEndPointAddress                %5u\n"
+		       "        bEndpointAddress                 0x%02x  EP %u %s\n"
 		       "        bmInfo                          %5u\n"
 		       "        bTerminalLink                   %5u\n"
 		       "        bStillCaptureMethod             %5u\n"
 		       "        bTriggerSupport                 %5u\n"
 		       "        bTriggerUsage                   %5u\n"
 		       "        bControlSize                    %5u\n",
-		       p, buf[4] | (buf[5] << 8), buf[6], buf[7], buf[8],
-		       buf[9], buf[10], buf[11], n);
+		       p, buf[4] | (buf[5] << 8),
+		       buf[6], buf[6] & 0x0f, (buf[6] & 0x80) ? "IN" : "OUT",
+		       buf[7], buf[8], buf[9], buf[10], buf[11], n);
 		for (i = 0; i < p; i++)
 			printf(
 			"        bmaControls(%2u)                 %5u\n",
@@ -1780,10 +1870,12 @@ static void dump_videostreaming_interface(const unsigned char *buf)
 			printf("      Warning: Descriptor too short\n");
 		printf("        bNumFormats                 %5u\n"
 		       "        wTotalLength               0x%04x\n"
-		       "        bEndpointAddress            %5u\n"
+		       "        bEndpointAddress             0x%02x  EP %u %s\n"
 		       "        bTerminalLink               %5u\n"
 		       "        bControlSize                %5u\n",
-		       p, buf[4] | (buf[5] << 8), buf[6], buf[7], n);
+		       p, buf[4] | (buf[5] << 8),
+		       buf[6], buf[6] & 0x0f, (buf[6] & 0x80) ? "IN" : "OUT",
+		       buf[7], n);
 		for (i = 0; i < p; i++)
 			printf(
 			"        bmaControls(%2u)             %5u\n",
@@ -1797,9 +1889,9 @@ static void dump_videostreaming_interface(const unsigned char *buf)
 		m = buf[5+4*n];
 		if (buf[0] < 6+4*n+m)
 			printf("      Warning: Descriptor too short\n");
-		printf("        bEndpointAddress                %5u\n"
+		printf("        bEndpointAddress                 0x%02x  EP %u %s\n"
 		       "        bNumImageSizePatterns             %3u\n",
-		       buf[3], n);
+		       buf[3], buf[3] & 0x0f, (buf[3] & 0x80) ? "IN" : "OUT", n);
 		for (i = 0; i < n; i++)
 			printf("        wWidth(%2u)                      %5u\n"
 			       "        wHeight(%2u)                     %5u\n",
@@ -2130,8 +2222,8 @@ static void dump_ccid_device(const unsigned char *buf)
 	       "        bDescriptorType     %5u\n"
 	       "        bcdCCID             %2x.%02x",
 	       buf[0], buf[1], buf[3], buf[2]);
-	if (buf[3] != 1 || buf[2] != 0)
-		fputs("  (Warning: Only accurate for version 1.0)", stdout);
+	if (buf[3] != 1 || (buf[2] != 0 && buf[2] != 0x10))
+		fputs("  (Warning: Only accurate for version 1.0/1.1)", stdout);
 	putchar('\n');
 
 	printf("        nMaxSlotIndex       %5u\n"
@@ -2155,7 +2247,7 @@ static void dump_ccid_device(const unsigned char *buf)
 	us = convert_le_u32(buf+10);
 	printf("        dwDefaultClock      %5u\n", us);
 	us = convert_le_u32(buf+14);
-	printf("        dwMaxiumumClock     %5u\n", us);
+	printf("        dwMaximumClock      %5u\n", us);
 	printf("        bNumClockSupported  %5u\n", buf[18]);
 	us = convert_le_u32(buf+19);
 	printf("        dwDataRate        %7u bps\n", us);
@@ -2200,9 +2292,9 @@ static void dump_ccid_device(const unsigned char *buf)
 		fputs("          Auto clock change\n", stdout);
 	if ((us & 0x0020))
 		fputs("          Auto baud rate change\n", stdout);
-	if ((us & 0x0040))
+	if ((us & (0x0040 | 0x0080)) == 0x0040)
 		fputs("          Auto parameter negotiation made by CCID\n", stdout);
-	else if ((us & 0x0080))
+	else if ((us & (0x0040 | 0x0080)) == 0x0080)
 		fputs("          Auto PPS made by CCID\n", stdout);
 	else if ((us & (0x0040 | 0x0080)))
 		fputs("        WARNING: conflicting negotiation features\n", stdout);
@@ -2210,18 +2302,23 @@ static void dump_ccid_device(const unsigned char *buf)
 	if ((us & 0x0100))
 		fputs("          CCID can set ICC in clock stop mode\n", stdout);
 	if ((us & 0x0200))
-		fputs("          NAD value other than 0x00 accepted\n", stdout);
+		fputs("          NAD value other than 0x00 accepted (T=1)\n", stdout);
 	if ((us & 0x0400))
-		fputs("          Auto IFSD exchange\n", stdout);
+		fputs("          Auto IFSD exchange (T=1)\n", stdout);
 
-	if ((us & 0x00010000))
+	if ((us & 0x00070000) == 0)
+		fputs("          Character level exchange\n", stdout);
+	else if ((us & 0x00070000) == 0x00010000)
 		fputs("          TPDU level exchange\n", stdout);
-	else if ((us & 0x00020000))
+	else if ((us & 0x00070000) == 0x00020000)
 		fputs("          Short APDU level exchange\n", stdout);
-	else if ((us & 0x00040000))
+	else if ((us & 0x00070000) == 0x00040000)
 		fputs("          Short and extended APDU level exchange\n", stdout);
 	else if ((us & 0x00070000))
 		fputs("        WARNING: conflicting exchange levels\n", stdout);
+
+	if ((us & 0x00100000))
+		fputs("          USB wakeup on ICC insertion and removal\n", stdout);
 
 	us = convert_le_u32(buf+44);
 	printf("        dwMaxCCIDMsgLen     %5u\n", us);
@@ -2269,8 +2366,8 @@ static void dump_report_desc(unsigned char *b, int l)
 {
 	unsigned int j, bsize, btag, btype, data = 0xffff, hut = 0xffff;
 	int i;
-	char *types[4] = { "Main", "Global", "Local", "reserved" };
-	char indent[] = "                            ";
+	static const char * const types[4] = { "Main", "Global", "Local", "reserved" };
+	static const char indent[] = "                            ";
 
 	printf("          Report Descriptor: (length is %d)\n", l);
 	for (i = 0; i < l; ) {
@@ -2420,6 +2517,7 @@ static void dump_printer_device(libusb_device_handle *dev,
 			else if ((caps & 0x60) == 0x60)
 				printf(" Negotiable-Auth");
 			printf("\n");
+			free(uuid);
 			break;
 		}
 		default:
@@ -2435,8 +2533,7 @@ static void dump_hid_device(libusb_device_handle *dev,
 			    const struct libusb_interface_descriptor *interface,
 			    const unsigned char *buf)
 {
-	unsigned int i, len;
-	unsigned int n;
+	int i, len;
 	unsigned char dbuf[8192];
 
 	if (buf[1] != LIBUSB_DT_HID)
@@ -2461,8 +2558,8 @@ static void dump_hid_device(libusb_device_handle *dev,
 		return;
 
 	if (!dev) {
-		printf("         Report Descriptors: \n"
-		       "           ** UNAVAILABLE **\n");
+		printf("          Report Descriptors: \n"
+		       "            ** UNAVAILABLE **\n");
 		return;
 	}
 
@@ -2471,13 +2568,13 @@ static void dump_hid_device(libusb_device_handle *dev,
 		if (buf[6+3*i] != LIBUSB_DT_REPORT)
 			continue;
 		len = buf[7+3*i] | (buf[8+3*i] << 8);
-		if (len > (unsigned int)sizeof(dbuf)) {
+		if (len > (int)sizeof(dbuf)) {
 			printf("report descriptor too long\n");
 			continue;
 		}
 		if (libusb_claim_interface(dev, interface->bInterfaceNumber) == 0) {
 			int retries = 4;
-			n = 0;
+			int n = 0;
 			while (n < len && retries--)
 				n = usb_control_msg(dev,
 					 LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_STANDARD
@@ -2492,24 +2589,27 @@ static void dump_hid_device(libusb_device_handle *dev,
 				if (n < len)
 					printf("          Warning: incomplete report descriptor\n");
 				dump_report_desc(dbuf, n);
+			} else {
+				printf("          Warning: can't get report descriptor, %s\n",
+						  libusb_error_name(n));
 			}
 			libusb_release_interface(dev, interface->bInterfaceNumber);
 		} else {
 			/* recent Linuxes require claim() for RECIP_INTERFACE,
 			 * so "rmmod hid" will often make these available.
 			 */
-			printf("         Report Descriptors: \n"
-			       "           ** UNAVAILABLE **\n");
+			printf("          Report Descriptors: \n"
+			       "            ** UNAVAILABLE **\n");
 		}
 	}
 }
 
-static char *
-dump_comm_descriptor(libusb_device_handle *dev, const unsigned char *buf, char *indent)
+static void
+dump_comm_descriptor(libusb_device_handle *dev, const unsigned char *buf, const char *indent)
 {
 	int		tmp;
 	char		*str = NULL;
-	char		*type;
+	const char	*type;
 
 	switch (buf[2]) {
 	case 0:
@@ -2640,7 +2740,41 @@ dump_comm_descriptor(libusb_device_handle *dev, const unsigned char *buf, char *
 		       indent,
 		       indent, buf[3], (buf[3] && *str) ? str : "(?\?)",
 		       indent, tmp);
-		/* FIXME dissect ALL 28 bits */
+		/* TODO
+		 * Translate all 28 bits of bmEthernetStatistics into something "real"  Here's the bitfields if someone
+		 * wants to do this in the future.  As specified in the USB CDC ECM Subclass document, version 1.2,
+		 * table 4:
+		 * D00	XMIT_OK			Frames transmitted without errors
+		 * D01	RVC_OK			Frames received without errors
+		 * D02	XMIT_ERROR		Frames not transmitted, or transmitted with errors
+		 * D03	RCV_ERROR		Frames received with errors that are not delivered to the USB host.
+		 * D04	RCV_NO_BUFFER		Frame missed, no buffers
+		 * D05	DIRECTED_BYTES_XMIT	Directed bytes transmitted without errors
+		 * D06	DIRECTED_FRAMES_XMIT	Directed frames transmitted without errors
+		 * D07	MULTICAST_BYTES_XMIT	Multicast bytes transmitted without errors
+		 * D08	MULTICAST_FRAMES_XMIT	Multicast frames transmitted without errors
+		 * D09	BROADCAST_BYTES_XMIT	Broadcast bytes transmitted without errors
+		 * D10	BROADCAST_FRAMES_XMIT	Broadcast frames transmitted without errors
+		 * D11	DIRECTED_BYTES_RCV	Directed bytes received without errors
+		 * D12	DIRECTED_FRAMES_RCV	Directed frames received without errors
+		 * D13	MULTICAST_BYTES_RCV	Multicast bytes received without errors
+		 * D14	MULTICAST_FRAMES_RCV	Multicast frames received without errors
+		 * D15	BROADCAST_BYTES_RCV	Broadcast bytes received without errors
+		 * D16	BROADCAST_FRAMES_RCV	Broadcast frames received without errors
+		 * D17	RCV_CRC_ERROR		Frames received with circular redundancy check (CRC) or frame check sequence (FCS) error
+		 * D18	TRANSMIT_QUEUE_LENGTH	Length of transmit queue
+		 * D19	RCV_ERROR_ALIGNMENT	Frames received with alignment error
+		 * D20	XMIT_ONE_COLLISION	Frames transmitted with one collision
+		 * D21	XMIT_MORE_COLLISIONS	Frames transmitted with more than one collision
+		 * D22	XMIT_DEFERRED		Frames transmitted after deferral
+		 * D23	XMIT_MAX_COLLISIONS	Frames not transmitted due to collisions
+		 * D24	RCV_OVERRUN		Frames not received due to overrun
+		 * D25	XMIT_UNDERRUN		Frames not transmitted due to underrun
+		 * D26	XMIT_HEARTBEAT_FAILURE	Frames transmitted with heartbeat failure
+		 * D27	XMIT_TIMES_CRS_LOST	Times carrier sense signal lost during transmission
+		 * D28	XMIT_LATE_COLLISIONS	Late collisions detected
+		 * D29-D31 Reserved		Must be set to 0
+		 */
 		printf("%s  wMaxSegmentSize         %10d\n"
 		       "%s  wNumberMCFilters            0x%04x\n"
 		       "%s  bNumberPowerFilters     %10d\n",
@@ -2781,31 +2915,35 @@ dump_comm_descriptor(libusb_device_handle *dev, const unsigned char *buf, char *
 		       indent, buf[6] | (buf[7] << 8));
 		break;
 	default:
-		/* FIXME there are about a dozen more descriptor types */
+		/*
+		 * There are about a dozen more descriptor types, if anyone has
+		 * a device with them in it, we'll add them here in the future
+		 * if * really needed.
+		 */
 		printf("%sUNRECOGNIZED CDC: ", indent);
 		dump_bytes(buf, buf[0]);
-		return "unrecognized comm descriptor";
+		return;
 	}
 
 	free(str);
 
-	return 0;
+	return;
 
 bad:
 	printf("%sINVALID CDC (%s): ", indent, type);
 	dump_bytes(buf, buf[0]);
-	return "corrupt comm descriptor";
 }
 
 /* ---------------------------------------------------------------------- */
 
-static void do_hub(libusb_device_handle *fd, unsigned tt_type, unsigned speed)
+static void do_hub(libusb_device_handle *fd, unsigned tt_type, unsigned speed,
+		   bool has_ssp)
 {
 	unsigned char buf[7 /* base descriptor */
 			+ 2 /* bitmasks */ * HUB_STATUS_BYTELEN];
 	int i, ret, value;
 	unsigned int link_state;
-	const char * const link_state_descriptions[] = {
+	static const char * const link_state_descriptions[] = {
 		"U0",
 		"U1",
 		"U2",
@@ -2819,6 +2957,7 @@ static void do_hub(libusb_device_handle *fd, unsigned tt_type, unsigned speed)
 		"Compliance",
 		"Loopback",
 	};
+	bool is_ext_status = tt_type == 3 && speed >= 0x0310 && has_ssp;
 
 	/* USB 3.x hubs have a slightly different descriptor */
 	if (speed >= 0x0300)
@@ -2848,14 +2987,16 @@ static void do_hub(libusb_device_handle *fd, unsigned tt_type, unsigned speed)
 
 	printf(" Hub Port Status:\n");
 	for (i = 0; i < buf[2]; i++) {
-		unsigned char status[4];
+		unsigned char status[8];
 
+		/* Request EXT_PORT_STATUS for USB 3.1 SuperSpeedPlus hubs,
+		   PORT_STATUS otherwise */
 		ret = usb_control_msg(fd,
 				LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_CLASS
 					| LIBUSB_RECIPIENT_OTHER,
 				LIBUSB_REQUEST_GET_STATUS,
-				0, i + 1,
-				status, sizeof status,
+				is_ext_status ? 2 : 0, i + 1,
+				status, is_ext_status ? 8 : 4,
 				CTRL_TIMEOUT);
 		if (ret < 0) {
 			fprintf(stderr,
@@ -2868,7 +3009,7 @@ static void do_hub(libusb_device_handle *fd, unsigned tt_type, unsigned speed)
 			status[3], status[2],
 			status[1], status[0]);
 		/* CAPS are used to highlight "transient" states */
-		if (speed != 0x0300) {
+		if (speed < 0x0300) {
 			printf("%s%s%s%s%s",
 					(status[2] & 0x10) ? " C_RESET" : "",
 					(status[2] & 0x08) ? " C_OC" : "",
@@ -2910,6 +3051,16 @@ static void do_hub(libusb_device_handle *fd, unsigned tt_type, unsigned speed)
 					(status[0] & 0x02) ? " enable" : "",
 					(status[0] & 0x01) ? " connect" : "");
 		}
+
+		if (is_ext_status && (status[0] & 0x01)) {
+			printf("     Ext Status: %02x%02x.%02x%02x\n",
+				status[7], status[6],
+				status[5], status[4]);
+			printf("       RX Speed Attribute ID: %d Lanes: %d\n",
+				status[4] & 0x0f, (status[5] & 0x0f)+1);
+			printf("       TX Speed Attribute ID: %d Lanes: %d\n",
+				(status[4] >> 4) & 0x0f, ((status[5] >> 4) & 0x0f)+1);
+		}
 	}
 }
 
@@ -2924,8 +3075,14 @@ static void do_dualspeed(libusb_device_handle *fd)
 			LIBUSB_REQUEST_GET_DESCRIPTOR,
 			USB_DT_DEVICE_QUALIFIER << 8, 0,
 			buf, sizeof buf, CTRL_TIMEOUT);
-	if (ret < 0 && errno != EPIPE)
-		perror("can't get device qualifier");
+
+	/* We don't need to complain to the user if the device is claimed
+	 * and we aren't allowed to access the device qualifier.
+	 */
+	if (ret < 0 && errno != EPIPE) {
+		if (verblevel > 1 || errno != EAGAIN)
+			perror("can't get device qualifier");
+	}
 
 	/* all dual-speed devices have a qualifier */
 	if (ret != sizeof buf
@@ -2955,7 +3112,7 @@ static void do_dualspeed(libusb_device_handle *fd)
 	       buf[6], proto,
 	       buf[7], buf[8]);
 
-	/* FIXME also show the OTHER_SPEED_CONFIG descriptors */
+	/* TODO also show the OTHER_SPEED_CONFIG descriptors */
 }
 
 static void do_debug(libusb_device_handle *fd)
@@ -2968,8 +3125,14 @@ static void do_debug(libusb_device_handle *fd)
 			LIBUSB_REQUEST_GET_DESCRIPTOR,
 			USB_DT_DEBUG << 8, 0,
 			buf, sizeof buf, CTRL_TIMEOUT);
-	if (ret < 0 && errno != EPIPE)
-		perror("can't get debug descriptor");
+
+	/* We don't need to complain to the user if the device is claimed
+	 * and we aren't allowed to access the debug descriptor.
+	 */
+	if (ret < 0 && errno != EPIPE) {
+		if (verblevel > 1 || errno != EAGAIN)
+			perror("can't get debug descriptor");
+	}
 
 	/* some high speed devices are also "USB2 debug devices", meaning
 	 * you can use them with some EHCI implementations as another kind
@@ -3046,7 +3209,7 @@ static int do_otg(struct libusb_config_descriptor *config)
 }
 
 static void
-dump_device_status(libusb_device_handle *fd, int otg, int wireless, int super_speed)
+dump_device_status(libusb_device_handle *fd, int otg, int super_speed)
 {
 	unsigned char status[8];
 	int ret;
@@ -3072,14 +3235,6 @@ dump_device_status(libusb_device_handle *fd, int otg, int wireless, int super_sp
 		printf("  (Bus Powered)\n");
 	if (status[0] & (1 << 1))
 		printf("  Remote Wakeup Enabled\n");
-	if (status[0] & (1 << 2) && !super_speed) {
-		/* for high speed devices */
-		if (!wireless)
-			printf("  Test Mode\n");
-		/* for devices with Wireless USB support */
-		else
-			printf("  Battery Powered\n");
-	}
 	if (super_speed) {
 		if (status[0] & (1 << 2))
 			printf("  U1 Enabled\n");
@@ -3100,98 +3255,14 @@ dump_device_status(libusb_device_handle *fd, int otg, int wireless, int super_sp
 	/* for high speed devices with debug descriptors */
 	if (status[0] & (1 << 6))
 		printf("  Debug Mode\n");
-
-	if (!wireless)
-		return;
-
-	/* Wireless USB exposes FIVE different types of device status,
-	 * accessed by distinct wIndex values.
-	 */
-	ret = usb_control_msg(fd, LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_STANDARD
-				| LIBUSB_RECIPIENT_DEVICE,
-			LIBUSB_REQUEST_GET_STATUS,
-			0, 1 /* wireless status */,
-			status, 1,
-			CTRL_TIMEOUT);
-	if (ret < 0) {
-		fprintf(stderr,
-			"cannot read wireless %s, %s (%d)\n",
-			"status",
-			strerror(errno), errno);
-		return;
-	}
-	printf("Wireless Status:     0x%02x\n", status[0]);
-	if (status[0] & (1 << 0))
-		printf("  TX Drp IE\n");
-	if (status[0] & (1 << 1))
-		printf("  Transmit Packet\n");
-	if (status[0] & (1 << 2))
-		printf("  Count Packets\n");
-	if (status[0] & (1 << 3))
-		printf("  Capture Packet\n");
-
-	ret = usb_control_msg(fd, LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_STANDARD
-				| LIBUSB_RECIPIENT_DEVICE,
-			LIBUSB_REQUEST_GET_STATUS,
-			0, 2 /* Channel Info */,
-			status, 1,
-			CTRL_TIMEOUT);
-	if (ret < 0) {
-		fprintf(stderr,
-			"cannot read wireless %s, %s (%d)\n",
-			"channel info",
-			strerror(errno), errno);
-		return;
-	}
-	printf("Channel Info:        0x%02x\n", status[0]);
-
-	/* 3=Received data: many bytes, for count packets or capture packet */
-
-	ret = usb_control_msg(fd, LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_STANDARD
-				| LIBUSB_RECIPIENT_DEVICE,
-			LIBUSB_REQUEST_GET_STATUS,
-			0, 3 /* MAS Availability */,
-			status, 8,
-			CTRL_TIMEOUT);
-	if (ret < 0) {
-		fprintf(stderr,
-			"cannot read wireless %s, %s (%d)\n",
-			"MAS info",
-			strerror(errno), errno);
-		return;
-	}
-	printf("MAS Availability:    ");
-	dump_bytes(status, 8);
-
-	ret = usb_control_msg(fd, LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_STANDARD
-				| LIBUSB_RECIPIENT_DEVICE,
-			LIBUSB_REQUEST_GET_STATUS,
-			0, 5 /* Current Transmit Power */,
-			status, 2,
-			CTRL_TIMEOUT);
-	if (ret < 0) {
-		fprintf(stderr,
-			"cannot read wireless %s, %s (%d)\n",
-			"transmit power",
-			strerror(errno), errno);
-		return;
-	}
-	printf("Transmit Power:\n");
-	printf(" TxNotification:     0x%02x\n", status[0]);
-	printf(" TxBeacon:     :     0x%02x\n", status[1]);
 }
 
-static int do_wireless(libusb_device_handle *fd)
+static void dump_usb2_device_capability_desc(unsigned char *buf, bool lpm_required)
 {
-	/* FIXME fetch and dump BOS etc */
-	if (fd)
-		return 0;
-	return 0;
-}
-
-static void dump_usb2_device_capability_desc(unsigned char *buf)
-{
+	static const uint16_t besl_us[16] = { 125,  150,  200,	300,  400,  500,  1000, 2000,
+					      3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000 };
 	unsigned int wide;
+	unsigned int besl;
 
 	wide = buf[3] + (buf[4] << 8) +
 		(buf[5] << 16) + (buf[6] << 24);
@@ -3201,19 +3272,22 @@ static void dump_usb2_device_capability_desc(unsigned char *buf)
 			"    bDevCapabilityType  %5u\n"
 			"    bmAttributes   0x%08x\n",
 			buf[0], buf[1], buf[2], wide);
-	if (!(wide & 0x02))
+	if ((lpm_required || (wide & 0x04)) && !(wide & 0x02))
 		printf("      (Missing must-be-set LPM bit!)\n");
+	else if (!lpm_required && !(wide & 0x02))
+		printf("      Link Power Management (LPM) not supported\n");
 	else if (!(wide & 0x04))
-		printf("      HIRD Link Power Management (LPM)"
-				" Supported\n");
+		printf("      HIRD Link Power Management (LPM) Supported\n");
 	else {
-		printf("      BESL Link Power Management (LPM)"
-				" Supported\n");
-		if (wide & 0x08)
-			printf("    BESL value    %5u us \n", wide & 0xf00);
-		if (wide & 0x10)
-			printf("    Deep BESL value    %5u us \n",
-					wide & 0xf000);
+		printf("      BESL Link Power Management (LPM) Supported\n");
+		if (wide & 0x08) {
+			besl = (wide & 0xf00) >> 8;
+			printf("      Baseline BESL value  %5hu us \n", besl_us[besl]);
+		}
+		if (wide & 0x10) {
+			besl = (wide & 0xf000) >> 12;
+			printf("      Deep BESL value      %5hu us \n", besl_us[besl]);
+		}
 	}
 }
 
@@ -3273,7 +3347,7 @@ static void dump_ssp_device_capability_desc(unsigned char *buf)
 {
 	int i;
 	unsigned int bm_attr, ss_attr;
-	char bitrate_prefix[] = " KMG";
+	static const char bitrate_prefix[] = " KMG";
 
 	if (buf[0] < 12) {
 		fprintf(stderr, "  Bad SuperSpeedPlus USB Device Capability descriptor.\n");
@@ -3288,9 +3362,12 @@ static void dump_ssp_device_capability_desc(unsigned char *buf)
 			"    bmAttributes         0x%08x\n",
 			buf[0], buf[1], buf[2], bm_attr);
 
-	printf("      Sublink Speed Attribute count %u\n", buf[4] & 0x1f);
-	printf("      Sublink Speed ID count %u\n", (bm_attr >> 5) & 0xf);
+	printf("      Sublink Speed Attribute count %u\n", (buf[4] & 0x1f)+1);
+	printf("      Sublink Speed ID count %u\n", ((bm_attr >> 5) & 0xf)+1);
 	printf("    wFunctionalitySupport   0x%02x%02x\n", buf[9], buf[8]);
+	printf("      Min functional Speed Attribute ID: %u\n", buf[8] & 0x0f);
+	printf("      Min functional RX lanes: %u\n", buf[9] & 0x0f);
+	printf("      Min functional TX lanes: %u\n", (buf[9] >> 4) & 0x0f);
 
 	for (i = 0; i <= (buf[4] & 0x1f); i++) {
 		ss_attr = convert_le_u32(buf + 12 + (i * 4));
@@ -3324,7 +3401,7 @@ static void dump_container_id_device_capability_desc(unsigned char *buf)
 static char *get_webusb_url(libusb_device_handle *fd, uint8_t vendor_req, uint8_t id)
 {
 	unsigned char url_buf[255];
-	char *scheme;
+	const char *scheme;
 	char *url, *chr;
 	unsigned char i;
 	int ret;
@@ -3437,7 +3514,7 @@ static void dump_billboard_device_capability_desc(libusb_device_handle *dev, uns
 			"    bLength                 %5u\n"
 			"    bDescriptorType         %5u\n"
 			"    bDevCapabilityType      %5u\n"
-			"    iAddtionalInfoURL       %5u %s\n"
+			"    iAdditionalInfoURL      %5u %s\n"
 			"    bNumberOfAlternateModes %5u\n"
 			"    bPreferredAlternateMode %5u\n"
 			"    VCONN Power             %5u %s\n",
@@ -3480,7 +3557,7 @@ static void dump_billboard_device_capability_desc(libusb_device_handle *dev, uns
 	free (url);
 }
 
-static void dump_billboard_alt_mode_capability_desc(libusb_device_handle *dev, unsigned char *buf)
+static void dump_billboard_alt_mode_capability_desc(unsigned char *buf)
 {
 	if (buf[0] != 8) {
 		fprintf(stderr, "  Bad Billboard Alternate Mode Capability descriptor.\n");
@@ -3492,12 +3569,12 @@ static void dump_billboard_alt_mode_capability_desc(libusb_device_handle *dev, u
 			"    bDescriptorType         %5u\n"
 			"    bDevCapabilityType      %5u\n"
 			"    bIndex                  %5u\n"
-			"    dwAlternateModeVdo          0x%02X%02X%02X%02X\n",
+			"    dwAlternateModeVdo          0x%08X\n",
 			buf[0], buf[1], buf[2], buf[3],
-			buf[4], buf[5], buf[6], buf[7]);
+			convert_le_u32(&buf[4]));
 }
 
-static void dump_bos_descriptor(libusb_device_handle *fd)
+static void dump_bos_descriptor(libusb_device_handle *fd, bool* has_ssp, bool lpm_required)
 {
 	/* Total length of BOS descriptors varies.
 	 * Read first static 5 bytes which include the total length before
@@ -3561,16 +3638,17 @@ static void dump_bos_descriptor(libusb_device_handle *fd)
 		}
 		switch (buf[2]) {
 		case USB_DC_WIRELESS_USB:
-			/* FIXME */
+			/* It's dead!  Luckily no one has these devices so we can ignore it. */
 			break;
 		case USB_DC_20_EXTENSION:
-			dump_usb2_device_capability_desc(buf);
+			dump_usb2_device_capability_desc(buf, lpm_required);
 			break;
 		case USB_DC_SUPERSPEED:
 			dump_ss_device_capability_desc(buf);
 			break;
 		case USB_DC_SUPERSPEEDPLUS:
 			dump_ssp_device_capability_desc(buf);
+			*has_ssp = true;
 			break;
 		case USB_DC_CONTAINER_ID:
 			dump_container_id_device_capability_desc(buf);
@@ -3582,7 +3660,7 @@ static void dump_bos_descriptor(libusb_device_handle *fd)
 			dump_billboard_device_capability_desc(fd, buf);
 			break;
 		case USB_DC_BILLBOARD_ALT_MODE:
-			dump_billboard_alt_mode_capability_desc(fd, buf);
+			dump_billboard_alt_mode_capability_desc(buf);
 			break;
 		case USB_DC_CONFIGURATION_SUMMARY:
 			printf("  Configuration Summary Device Capability:\n");
@@ -3606,9 +3684,10 @@ static void dumpdev(libusb_device *dev)
 	libusb_device_handle *udev;
 	struct libusb_device_descriptor desc;
 	int i, ret;
-	int otg, wireless;
+	int otg;
+	bool has_ssp = false;
 
-	otg = wireless = 0;
+	otg = 0;
 	ret = libusb_open(dev, &udev);
 	if (ret) {
 		fprintf(stderr, "Couldn't open device, some information "
@@ -3617,9 +3696,7 @@ static void dumpdev(libusb_device *dev)
 	}
 
 	libusb_get_device_descriptor(dev, &desc);
-	dump_device(udev, &desc);
-	if (desc.bcdUSB == 0x0250)
-		wireless = do_wireless(udev);
+	dump_device(dev, &desc);
 	if (desc.bNumConfigurations) {
 		struct libusb_config_descriptor *config;
 
@@ -3647,16 +3724,15 @@ static void dumpdev(libusb_device *dev)
 	if (!udev)
 		return;
 
+	if (desc.bcdUSB >= 0x0201)
+		dump_bos_descriptor(udev, &has_ssp, desc.bcdUSB >= 0x0210);
 	if (desc.bDeviceClass == LIBUSB_CLASS_HUB)
-		do_hub(udev, desc.bDeviceProtocol, desc.bcdUSB);
-	if (desc.bcdUSB >= 0x0201) {
-		dump_bos_descriptor(udev);
-	}
+		do_hub(udev, desc.bDeviceProtocol, desc.bcdUSB, has_ssp);
 	if (desc.bcdUSB == 0x0200) {
 		do_dualspeed(udev);
 	}
 	do_debug(udev);
-	dump_device_status(udev, otg, wireless, desc.bcdUSB >= 0x0300);
+	dump_device_status(udev, otg, desc.bcdUSB >= 0x0300);
 	libusb_close(udev);
 }
 
@@ -3674,8 +3750,8 @@ static int dump_one_device(libusb_context *ctx, const char *path)
 		return 1;
 	}
 	libusb_get_device_descriptor(dev, &desc);
-	get_vendor_string(vendor, sizeof(vendor), desc.idVendor);
-	get_product_string(product, sizeof(product), desc.idVendor, desc.idProduct);
+	get_vendor_product_with_fallback(vendor, sizeof(vendor),
+			product, sizeof(product), dev);
 	printf("Device: ID %04x:%04x %s %s\n", desc.idVendor,
 					       desc.idProduct,
 					       vendor,
@@ -3684,13 +3760,38 @@ static int dump_one_device(libusb_context *ctx, const char *path)
 	return 0;
 }
 
+static void sort_device_list(libusb_device **list, ssize_t num_devs)
+{
+	struct libusb_device *dev, *dev_next;
+	int bnum, bnum_next, dnum, dnum_next;
+	ssize_t i;
+	int sorted;
+	sorted = 0;
+	do {
+		sorted = 1;
+		for (i = 0; i < num_devs - 1; ++i) {
+			dev = list[i];
+			dev_next = list[i + 1];
+			bnum = libusb_get_bus_number(dev);
+			dnum = libusb_get_device_address(dev);
+			bnum_next = libusb_get_bus_number(dev_next);
+			dnum_next = libusb_get_device_address(dev_next);
+			if ((bnum == bnum_next && dnum > dnum_next) || bnum > bnum_next) {
+				list[i] = dev_next;
+				list[i + 1] = dev;
+				sorted = 0;
+			}
+		}
+	} while(!sorted);
+}
+
 static int list_devices(libusb_context *ctx, int busnum, int devnum, int vendorid, int productid)
 {
 	libusb_device **list;
 	struct libusb_device_descriptor desc;
 	char vendor[128], product[128];
 	int status;
-	ssize_t num_devs, i, vendor_len, product_len;
+	ssize_t num_devs, i;
 
 	status = 1; /* 1 device not found, 0 device found */
 
@@ -3698,11 +3799,11 @@ static int list_devices(libusb_context *ctx, int busnum, int devnum, int vendori
 	if (num_devs < 0)
 		goto error;
 
+	sort_device_list(list, num_devs);
 	for (i = 0; i < num_devs; ++i) {
 		libusb_device *dev = list[i];
 		uint8_t bnum = libusb_get_bus_number(dev);
 		uint8_t dnum = libusb_get_device_address(dev);
-		uint8_t pnum = libusb_get_port_number(dev);
 
 		if ((busnum != -1 && busnum != bnum) ||
 		    (devnum != -1 && devnum != dnum))
@@ -3713,16 +3814,8 @@ static int list_devices(libusb_context *ctx, int busnum, int devnum, int vendori
 			continue;
 		status = 0;
 
-		vendor_len = get_vendor_string(vendor, sizeof(vendor), desc.idVendor);
-		if (vendor_len == 0)
-			read_sysfs_prop(vendor, sizeof(vendor), bnum, pnum,
-					"manufacturer");
-
-		product_len = get_product_string(product, sizeof(product),
-				desc.idVendor, desc.idProduct);
-		if (product_len == 0)
-			read_sysfs_prop(product, sizeof(product), bnum, pnum,
-					"product");
+		get_vendor_product_with_fallback(vendor, sizeof(vendor),
+				product, sizeof(product), dev);
 
 		if (verblevel > 0)
 			printf("\n");
@@ -3735,7 +3828,7 @@ static int list_devices(libusb_context *ctx, int busnum, int devnum, int vendori
 			dumpdev(dev);
 	}
 
-	libusb_free_device_list(list, 0);
+	libusb_free_device_list(list, 1);
 error:
 	return status;
 }
@@ -3767,7 +3860,7 @@ int main(int argc, char *argv[])
 			long_options, NULL)) != EOF) {
 		switch (c) {
 		case 'V':
-			printf("lsusb (" PACKAGE ") " VERSION "\n");
+			printf("lsusb (" PACKAGE_NAME ") " VERSION "\n");
 			return EXIT_SUCCESS;
 		case 'v':
 			verblevel++;
@@ -3838,7 +3931,10 @@ int main(int argc, char *argv[])
 			"  -h, --help\n"
 			"      Show usage and help\n"
 			);
-		return EXIT_FAILURE;
+		if (help && !err)
+			return 0;
+		else
+			return EXIT_FAILURE;
 	}
 
 
